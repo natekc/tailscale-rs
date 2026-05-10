@@ -10,14 +10,15 @@ use std::{
 use rustler::{Encoder, NifResult, ResourceArc, Term};
 use tracing::level_filters::LevelFilter;
 
+mod atomic_pid;
 mod config;
 mod tcp;
 mod udp;
 
+pub use atomic_pid::AtomicPid;
+use config::Keystate;
 use tcp::{TcpListener, TcpStream};
 use udp::UdpSocket;
-
-use crate::config::Keystate;
 
 mod atoms {
     rustler::atoms! {
