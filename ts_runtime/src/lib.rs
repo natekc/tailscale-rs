@@ -3,6 +3,7 @@
 extern crate ts_netstack_smoltcp as netstack;
 
 use core::time::Duration;
+use std::sync::Arc;
 
 use kameo::{
     actor::{ActorRef, Spawn, WeakActorRef},
@@ -23,6 +24,7 @@ mod derp_latency;
 mod env;
 mod error;
 mod multiderp;
+mod netmon;
 mod netstack_actor;
 mod packetfilter;
 pub mod peer_tracker;
@@ -66,6 +68,11 @@ impl Runtime {
         route_updater::RouteUpdater::spawn((multiderp.clone(), env.clone(), netstack_id));
         packetfilter::PacketfilterUpdater::spawn(env.clone());
         src_filter::SourceFilterUpdater::spawn(env.clone());
+
+        if let Some(mon) = ts_netmon::platform_mon() {
+            netmon::NetmonActor::spawn((env.clone(), Arc::new(mon)));
+        }
+
         let peer_tracker = PeerTracker::spawn(env.clone()).downgrade();
 
         let netstack =

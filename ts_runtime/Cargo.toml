@@ -18,6 +18,7 @@ ts_control.workspace = true
 ts_dataplane.workspace = true
 ts_keys.workspace = true
 ts_netcheck.workspace = true
+ts_netmon.workspace = true
 ts_netstack_smoltcp = { workspace = true, features = ["tokio"] }
 ts_overlay_router.workspace = true
 ts_packet.workspace = true
@@ -34,6 +35,7 @@ kameo = "0.19"
 kameo_actors = "0.4"
 thiserror.workspace = true
 tokio.workspace = true
+tokio-stream = { version = "0.1", default-features = false, features = ["time"] }
 tracing.workspace = true
 smallvec.workspace = true
 

@@ -6183,6 +6183,7 @@ dependencies = [
  "ts_derp",
  "ts_keys",
  "ts_netcheck",
+ "ts_netmon",
  "ts_netstack_smoltcp",
  "ts_overlay_router",
  "ts_packet",
