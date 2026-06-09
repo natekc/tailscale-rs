@@ -4,7 +4,10 @@ use kameo::{
     actor::{ActorRef, Spawn},
     message::Message,
 };
-use kameo_actors::message_bus::{MessageBus, Publish, Register};
+use kameo_actors::{
+    message_bus::{MessageBus, Publish, Register},
+    scheduler::Scheduler,
+};
 use tokio::sync::watch;
 
 use crate::{Error, error::ResultExt};
@@ -12,6 +15,8 @@ use crate::{Error, error::ResultExt};
 #[derive(Clone)]
 pub struct Env {
     pub bus: ActorRef<MessageBus>,
+    pub scheduler: ActorRef<Scheduler>,
+
     pub keys: Arc<ts_keys::NodeState>,
 
     /// Whether the runtime is shutdown.
@@ -29,6 +34,7 @@ impl Env {
     pub fn new(keys: ts_keys::NodeState, shutdown: watch::Receiver<bool>) -> Self {
         Self {
             bus: MessageBus::spawn_default(),
+            scheduler: Scheduler::spawn_default(),
             keys: Arc::new(keys),
             shutdown,
         }

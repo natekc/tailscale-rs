@@ -30,6 +30,7 @@ mod packetfilter;
 pub mod peer_tracker;
 mod route_updater;
 mod src_filter;
+mod stunner;
 
 pub(crate) use env::Env;
 pub use error::{Error, ErrorKind};
@@ -68,6 +69,7 @@ impl Runtime {
         route_updater::RouteUpdater::spawn((multiderp.clone(), env.clone(), netstack_id));
         packetfilter::PacketfilterUpdater::spawn(env.clone());
         src_filter::SourceFilterUpdater::spawn(env.clone());
+        stunner::Stunner::spawn(env.clone());
 
         if let Some(mon) = ts_netmon::platform_mon() {
             netmon::NetmonActor::spawn((env.clone(), Arc::new(mon)));
@@ -124,11 +126,13 @@ impl Runtime {
             let _ignore = runtime.control.stop_gracefully().await;
             let _ignore = runtime.dataplane.stop_gracefully().await;
             let _ignore = runtime.env.bus.stop_gracefully().await;
+            let _ignore = runtime.env.scheduler.stop_gracefully().await;
 
             tokio::join![
                 runtime.control.wait_for_shutdown(),
                 runtime.dataplane.wait_for_shutdown(),
                 runtime.env.bus.wait_for_shutdown(),
+                runtime.env.scheduler.wait_for_shutdown(),
             ];
         }
 
@@ -153,6 +157,7 @@ impl Drop for Runtime {
             self.control.kill();
             self.dataplane.kill();
             self.env.bus.kill();
+            self.env.scheduler.kill();
             return;
         }
 
@@ -169,6 +174,7 @@ impl Drop for Runtime {
 
         // Then shutdown the message bus, stopping the rest of the actors:
         try_shutdown(&self.env.bus);
+        try_shutdown(&self.env.scheduler);
     }
 }
 
