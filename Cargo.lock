@@ -6005,6 +6005,7 @@ dependencies = [
  "num-traits",
  "rand 0.10.2",
  "thiserror 2.0.18",
+ "ts_hexdump",
  "ts_keys",
  "zerocopy",
 ]
