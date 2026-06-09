@@ -1,4 +1,7 @@
-use core::marker::PhantomData;
+use core::{
+    fmt::{Debug, Formatter},
+    marker::PhantomData,
+};
 
 use aead::{AeadInPlace, generic_array::GenericArray};
 use crypto_box::Tag;
@@ -69,6 +72,51 @@ pub struct Packet<CryptState: ?Sized> {
     phantom: PhantomData<CryptState>,
     header: Header,
     payload: AeadTaggedPayload,
+}
+
+impl Debug for Packet<Encrypted> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Packet<Encrypted>")
+            .field("header", &self.header)
+            .field("aead_tag", &self.payload.tag)
+            .field(
+                "payload",
+                &format_args!("<encrypted> (len={})", self.payload.payload.len()),
+            )
+            .finish()
+    }
+}
+
+macro_rules! fmt_pkt {
+    ($fmt:expr, $self:expr, $($knownty:ident),*) => {
+        match $self.ty() {
+            $(
+                Some(MessageType::$knownty) => match $self.as_msg::<crate::$knownty>() {
+                    Some(x) => ($fmt).field("payload", &x),
+                    None => ($fmt).field("payload", &concat!("<invalid ", stringify!($knownty), ">")),
+                },
+            )*
+
+            // Rest: message types not implemented yet (UDP relay, at the moment)
+            Some(no_msgty) => ($fmt)
+                .field("payload", &"<unimplemented>")
+                .field("ty", &no_msgty),
+
+            None => ($fmt).field("payload", &"<unknown>").field("ty", &$self.ty_raw()),
+        }
+    }
+}
+
+impl Debug for Packet<Plaintext> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        let mut d = f.debug_struct("Packet<Plaintext>");
+
+        let d = d
+            .field("header", &self.header)
+            .field("aead_tag", &self.payload.tag);
+
+        fmt_pkt!(d, self, Ping, Pong, CallMeMaybe).finish()
+    }
 }
 
 impl<CryptState> Packet<CryptState>

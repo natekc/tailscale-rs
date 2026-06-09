@@ -1,5 +1,6 @@
 use core::{
     cmp::Ordering,
+    fmt::Debug,
     hash::Hash,
     net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6},
 };
@@ -11,7 +12,6 @@ use zerocopy::NetworkEndian;
 ///
 /// All addresses are encoded as IPv6: IPv4 is mapped.
 #[derive(
-    Debug,
     Copy,
     Clone,
     PartialEq,
@@ -27,6 +27,12 @@ use zerocopy::NetworkEndian;
 pub struct Endpoint {
     addr: [zerocopy::U16<NetworkEndian>; 8],
     port: zerocopy::U16<NetworkEndian>,
+}
+
+impl Debug for Endpoint {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.socket_addr().fmt(f)
+    }
 }
 
 impl Endpoint {
