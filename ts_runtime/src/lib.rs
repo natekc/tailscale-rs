@@ -33,10 +33,12 @@ mod retained_bus;
 mod route_updater;
 mod src_filter;
 mod stunner;
+mod task;
 
 pub(crate) use env::Env;
 pub use error::{Error, ErrorKind};
 pub use registry::Registry;
+pub use task::{ErasedTask, Task};
 
 use crate::peer_tracker::PeerTracker;
 
