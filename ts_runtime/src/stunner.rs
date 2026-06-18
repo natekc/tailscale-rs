@@ -64,7 +64,7 @@ impl kameo::Actor for Stunner {
     type Error = crate::Error;
 
     async fn on_start(env: Self::Args, slf: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // panicking in on_start is fine, this is checked as part of Runtime::spawn
+        // panicking in on_start is fine
         let stun = ts_netcheck::StunProber::try_new().await.unwrap();
         env.subscribe::<Arc<ts_control::StateUpdate>>(&slf).await?;
 

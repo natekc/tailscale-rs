@@ -2,19 +2,14 @@
 
 extern crate ts_netstack_smoltcp as netstack;
 
-use core::time::Duration;
 use std::sync::Arc;
 
-use kameo::{
-    actor::{ActorRef, Spawn, WeakActorRef},
-    mailbox::Signal,
-};
-use netstack::netcore::Channel;
-use tokio::sync::{Mutex, watch};
+use kameo::message::Context;
+use tokio::sync::Mutex;
 
 use crate::{
-    control_runner::ControlRunner, dataplane::DataplaneActor, multiderp::Multiderp,
-    netstack_actor::NetstackActor,
+    control_runner::ControlRunner, dataplane::DataplaneActor, env::RegForwarded,
+    multiderp::Multiderp, netstack_actor::NetstackActor, peer_tracker::PeerTracker,
 };
 
 /// Control runner.
@@ -37,232 +32,136 @@ mod task;
 
 pub(crate) use env::Env;
 pub use error::{Error, ErrorKind};
+pub use kameo::actor::{ActorRef, Spawn};
 pub use registry::Registry;
 pub use task::{ErasedTask, Task};
 
-use crate::peer_tracker::PeerTracker;
-
-/// Wait for all of the listed [`ActorRef`]s to start, ensuring they haven't failed.
-///
-/// TODO(npry): we only do this this way because we don't currently have a supervision tree and any
-/// of these actors failing to start means that the runtime is permanently compromised. In the
-/// future, it should not be a fatal error to start up the runtime if your underlay network is
-/// offline, where it currently is because e.g. control will fail its on_start if it can't connect,
-/// so it will just be dead forever, making your runtime unusable.
-///
-/// So long as we're lacking the supervision functionality, it's better to fail early/fast like this
-/// and have it take down the whole runtime before it starts rather than living with a
-/// silently-degraded one; the actors being dead would only be surfaced later when something tried
-/// to talk to them.
-macro_rules! try_join_startup {
-    ($([$($optaref:ident)*] $(,)?)? $($aref:ident),* $(,)?) => {
-        {
-            tokio::try_join![
-                $(
-                    $(
-                        match $optaref.as_ref() {
-                            Some(aref) => {
-                                Box::pin(map_startup_result(aref)) as core::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>
-                            },
-                            None => {
-                                Box::pin(core::future::ready(Ok(()))) as core::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>
-                            }
-                        },
-                    )*
-                )?
-                $(
-                    map_startup_result(&$aref),
-                )*
-            ]
-        }
-    }
-}
-
-async fn map_startup_result<A>(aref: &ActorRef<A>) -> Result<(), Error>
-where
-    A: kameo::Actor,
-    A::Error: core::error::Error,
-{
-    aref.wait_for_startup_with_result(|r| {
-        r.map_err(|e| {
-            // TODO(npry): due to https://github.com/tqwewe/kameo/pull/340, we _must not_ access
-            // `e`'s internals (via Debug, Display, or a field access) in this closure scope if it's
-            // a panic error or it will deadlock this thread. `Error::from` upholds this invariant
-            // (and drops the error, so it won't cause the issue later on), but we don't want to
-            // print it as part of this trace for now.
-            tracing::error!(actor = ?aref, "startup for actor failed");
-
-            Error::from(e).with_actor_info(aref.clone())
-        })
-    })
-    .await
-}
-
 /// The runtime for a tailscale device.
 pub struct Runtime {
-    /// Reference to the control actor.
-    pub control: ActorRef<ControlRunner>,
-    dataplane: ActorRef<DataplaneActor>,
-    netstack: WeakActorRef<NetstackActor>,
-    /// Reference to the peer tracker for peer lookups.
-    pub peer_tracker: WeakActorRef<PeerTracker>,
     env: Env,
-    shutdown: watch::Sender<bool>,
 }
 
-impl Runtime {
-    /// Spawn a new runtime with the given parameters for connecting to a tailnet.
-    pub async fn spawn(
-        config: ts_control::Config,
-        auth_key: Option<String>,
-        keys: ts_keys::NodeState,
-    ) -> Result<Self, Error> {
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let env = Env::new(keys, shutdown_rx);
+/// Configuration for starting a [`Runtime`].
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// The control configuration to use.
+    pub control_config: ts_control::Config,
+    /// The auth key to use to connect to the control server.
+    pub auth_key: Option<String>,
+    /// The keys to use.
+    pub keys: ts_keys::NodeState,
+}
 
-        let dataplane = DataplaneActor::spawn(env.clone());
+impl kameo::Actor for Runtime {
+    type Error = Error;
+    type Args = Config;
 
-        let (netstack_id, netstack_up, netstack_down) =
-            dataplane.ask(dataplane::NewOverlayTransport).await?;
+    async fn on_start(config: Config, slf: ActorRef<Self>) -> Result<Self, Self::Error> {
+        let env = Env::new(config.keys);
 
-        Multiderp::spawn(env.clone());
+        env.bus.link(&slf).await;
+        env.scheduler.link(&slf).await;
+        env.registry.link(&slf).await;
 
-        let rt_upd = route_updater::RouteUpdater::spawn((env.clone(), netstack_id));
-        let pf_upd = packetfilter::PacketfilterUpdater::spawn(env.clone());
-        let src_upd = src_filter::SourceFilterUpdater::spawn(env.clone());
-        let stunner = stunner::Stunner::spawn(env.clone());
+        #[cfg(feature = "console")]
+        {
+            // Runs detached.
+            if let Err(e) =
+                kameo::console::serve((core::net::Ipv4Addr::new(127, 0, 0, 1), 9999)).await
+            {
+                tracing::error!(error = %e, "console died");
+            };
+        }
 
-        let netmon = ts_netmon::platform_mon()
-            .map(|mon| netmon::NetmonActor::spawn((env.clone(), Arc::new(mon))));
+        DataplaneActor::supervise(&slf, env.clone()).spawn().await;
 
-        let peer_tracker = PeerTracker::spawn(env.clone());
-
-        let netstack = NetstackActor::spawn((
-            env.clone(),
-            Default::default(),
-            netstack_up,
-            Arc::new(Mutex::new(netstack_down)),
-        ));
-
-        let control = ControlRunner::spawn(control_runner::Params {
-            config,
-            auth_key,
-            env: env.clone(),
-        });
-
-        // Construct the Runtime _before_ awaiting all actor startups so we get the cleanup in its
-        // Drop for free.
-        let rt = Self {
-            control: control.clone(),
-            dataplane: dataplane.clone(),
-            peer_tracker: peer_tracker.downgrade(),
-            netstack: netstack.downgrade(),
-            env,
-            shutdown: shutdown_tx,
-        };
-
-        tracing::trace!("waiting for actors to finish starting");
-        try_join_startup![
-            [netmon],
-            dataplane,
-            rt_upd,
-            pf_upd,
-            src_upd,
-            stunner,
-            peer_tracker,
-            netstack,
-            control,
-        ]?;
-        tracing::trace!("all root actors started ok");
-
-        Ok(rt)
-    }
-
-    /// Get a channel to send commands to the netstack.
-    pub async fn channel(&self) -> Result<Channel, Error> {
-        let (channel,) = self
-            .netstack
-            .upgrade()
-            .ok_or(Error {
-                kind: ErrorKind::ActorGone,
-                target_actor: None,
-                message_ty: None,
-            })?
-            .ask(netstack_actor::GetChannel)
+        let (netstack_id, netstack_up, netstack_down) = env
+            .ask::<DataplaneActor, _>(None, dataplane::NewOverlayTransport, true)
             .await?;
 
-        Ok(channel)
-    }
+        Multiderp::supervise(&slf, env.clone()).spawn().await;
 
-    /// Attempt to shut down the runtime gracefully.
-    ///
-    /// Returns false if the shutdown timed out. It is still shut down if it timed out, just
-    /// more violently and with possible resource leaks.
-    pub async fn graceful_shutdown(self, timeout: Option<Duration>) -> bool {
-        self.shutdown.send_replace(true);
+        route_updater::RouteUpdater::supervise(&slf, (env.clone(), netstack_id))
+            .spawn()
+            .await;
+        packetfilter::PacketfilterUpdater::supervise(&slf, env.clone())
+            .spawn()
+            .await;
+        src_filter::SourceFilterUpdater::supervise(&slf, env.clone())
+            .spawn()
+            .await;
+        stunner::Stunner::supervise(&slf, env.clone()).spawn().await;
 
-        async fn _shutdown_all(runtime: Runtime) {
-            // See the note in `Drop` for why we only need to stop these actors to bring down the
-            // whole runtime.
-
-            let _ignore = runtime.control.stop_gracefully().await;
-            let _ignore = runtime.dataplane.stop_gracefully().await;
-            let _ignore = runtime.env.bus.stop_gracefully().await;
-            let _ignore = runtime.env.scheduler.stop_gracefully().await;
-
-            tokio::join![
-                runtime.control.wait_for_shutdown(),
-                runtime.dataplane.wait_for_shutdown(),
-                runtime.env.bus.wait_for_shutdown(),
-                runtime.env.scheduler.wait_for_shutdown(),
-            ];
+        if let Some(mon) = ts_netmon::platform_mon() {
+            netmon::NetmonActor::supervise(&slf, (env.clone(), Arc::new(mon)))
+                .spawn()
+                .await;
         }
 
-        let fut = _shutdown_all(self);
+        PeerTracker::supervise(&slf, env.clone()).spawn().await;
 
-        match timeout {
-            Some(timeout) => tokio::time::timeout(timeout, fut).await.is_ok(),
-            None => {
-                fut.await;
-                true
+        NetstackActor::supervise(
+            &slf,
+            (
+                env.clone(),
+                Default::default(),
+                netstack_up,
+                Arc::new(Mutex::new(netstack_down)),
+            ),
+        )
+        .spawn()
+        .await;
+
+        ControlRunner::supervise(
+            &slf,
+            control_runner::Params {
+                config: config.control_config,
+                auth_key: config.auth_key,
+                env: env.clone(),
+            },
+        )
+        .spawn()
+        .await;
+
+        // Actors we forward messages for:
+        env.wait::<ControlRunner>(None).await?;
+        env.wait::<NetstackActor>(None).await?;
+        env.wait::<PeerTracker>(None).await?;
+
+        Ok(Self { env })
+    }
+}
+
+macro_rules! forward {
+    ($actor:ty, $($msg:ty),* $(,)?) => {
+        $(
+            pub use $msg;
+
+            impl kameo::message::Message<$msg> for Runtime {
+                type Reply = RegForwarded<$actor, $msg>;
+
+                async fn handle(
+                    &mut self,
+                    msg: $msg,
+                    ctx: &mut Context<Self, Self::Reply>,
+                ) -> RegForwarded<$actor, $msg> {
+                    self.env.forward(ctx, None, msg).await
+                }
             }
-        }
-    }
+        )*
+    };
 }
 
-impl Drop for Runtime {
-    fn drop(&mut self) {
-        // We must have already run `graceful_shutdown`: on the happy path, this does nothing, but
-        // if it timed out, we need to make sure the actors are dead so we don't leak them and their
-        // dependents.
-        if *self.shutdown.borrow() {
-            self.control.kill();
-            self.dataplane.kill();
-            self.env.bus.kill();
-            self.env.scheduler.kill();
-            return;
-        }
-
-        self.shutdown.send_replace(true);
-
-        // Actors shut down when the last ActorRef to them is dropped (as nothing can send them
-        // messages anymore). If we don't hold an ActorRef in Runtime, in general the only thing
-        // that has one is the MessageBus, which each actor subscribes to for a subset of messages.
-        // Hence, if we shut down the bus, most actors die as well.
-
-        // First shut down the actors we have an ActorRef to:
-        try_shutdown(&self.control);
-        try_shutdown(&self.dataplane);
-
-        // Then shutdown the message bus, stopping the rest of the actors:
-        try_shutdown(&self.env.bus);
-        try_shutdown(&self.env.scheduler);
-    }
-}
-
-fn try_shutdown(a: &ActorRef<impl kameo::Actor>) {
-    if let Err(e) = a.mailbox_sender().try_send(Signal::Stop) {
-        tracing::error!(error = %e, "graceful shutdown failed, killing actor");
-        a.kill();
-    }
-}
+forward!(NetstackActor, netstack_actor::GetChannel);
+forward!(
+    ControlRunner,
+    control_runner::Ipv4,
+    control_runner::Ipv6,
+    control_runner::SelfNode
+);
+forward!(
+    PeerTracker,
+    peer_tracker::PeerByName,
+    peer_tracker::PeerByTailnetIp,
+    peer_tracker::PeerByAcceptedRoute
+);

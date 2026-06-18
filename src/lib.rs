@@ -137,6 +137,7 @@ pub use error::{Error, InternalErrorKind};
 #[doc(inline)]
 pub use ts_control::Node as NodeInfo;
 use ts_netstack_smoltcp::{CreateSocket, netcore::Channel};
+use ts_runtime::Spawn;
 
 #[cfg(feature = "axum")]
 pub mod axum;
@@ -151,7 +152,7 @@ pub mod ssh;
 /// with tailnet peers. Its tailnet identity is determined by the key state provided at
 /// construction-time.
 pub struct Device {
-    runtime: ts_runtime::Runtime,
+    runtime: ts_runtime::ActorRef<ts_runtime::Runtime>,
     channel: Channel,
 }
 
@@ -175,9 +176,21 @@ impl Device {
     pub async fn new(config: &Config, auth_key: Option<String>) -> Result<Self, Error> {
         check_magic_env()?;
 
-        let rt =
-            ts_runtime::Runtime::spawn(config.into(), auth_key, (&config.key_state).into()).await?;
-        let channel = rt.channel().await?;
+        let keys = (&config.key_state).into();
+        let rt = ts_runtime::Runtime::spawn(ts_runtime::Config {
+            control_config: config.into(),
+            auth_key,
+            keys,
+        });
+
+        rt.wait_for_startup_result()
+            .await
+            .map_err(ts_runtime::Error::from)?;
+
+        let (channel,) = rt
+            .ask(ts_runtime::GetChannel)
+            .await
+            .map_err(ts_runtime::Error::from)?;
 
         Ok(Self {
             runtime: rt,
@@ -188,8 +201,7 @@ impl Device {
     /// Get this [`Device`]'s IPv4 tailnet address.
     pub async fn ipv4_addr(&self) -> Result<Ipv4Addr, Error> {
         self.runtime
-            .control
-            .ask(ts_runtime::control_runner::Ipv4)
+            .ask(ts_runtime::Ipv4)
             .await
             .map_err(ts_runtime::Error::from)?
             .ok_or(Error::Internal(InternalErrorKind::Actor))
@@ -198,8 +210,7 @@ impl Device {
     /// Get this [`Device`]'s IPv6 tailnet address.
     pub async fn ipv6_addr(&self) -> Result<Ipv6Addr, Error> {
         self.runtime
-            .control
-            .ask(ts_runtime::control_runner::Ipv6)
+            .ask(ts_runtime::Ipv6)
             .await
             .map_err(ts_runtime::Error::from)?
             .ok_or(Error::Internal(InternalErrorKind::Actor))
@@ -240,8 +251,7 @@ impl Device {
     /// Get our node info.
     pub async fn self_node(&self) -> Result<NodeInfo, Error> {
         self.runtime
-            .control
-            .ask(ts_runtime::control_runner::SelfNode)
+            .ask(ts_runtime::SelfNode)
             .await
             .map_err(ts_runtime::Error::from)?
             .ok_or(Error::Internal(InternalErrorKind::Actor))
@@ -249,29 +259,19 @@ impl Device {
 
     /// Look up a peer by name.
     pub async fn peer_by_name(&self, name: &str) -> Result<Option<NodeInfo>, Error> {
-        let pt = self
-            .runtime
-            .peer_tracker
-            .upgrade()
-            .ok_or(Error::Internal(InternalErrorKind::Actor))?;
-
-        pt.ask(ts_runtime::peer_tracker::PeerByName {
-            name: name.to_string(),
-        })
-        .await
-        .map_err(ts_runtime::Error::from)
-        .map_err(Into::into)
+        self.runtime
+            .ask(ts_runtime::peer_tracker::PeerByName {
+                name: name.to_string(),
+            })
+            .await
+            .map_err(ts_runtime::Error::from)
+            .map_err(Into::into)
     }
 
     /// Look up a peer by ip.
     pub async fn peer_by_tailnet_ip(&self, ip: IpAddr) -> Result<Option<NodeInfo>, Error> {
-        let pt = self
-            .runtime
-            .peer_tracker
-            .upgrade()
-            .ok_or(Error::Internal(InternalErrorKind::Actor))?;
-
-        pt.ask(ts_runtime::peer_tracker::PeerByTailnetIp { ip })
+        self.runtime
+            .ask(ts_runtime::peer_tracker::PeerByTailnetIp { ip })
             .await
             .map_err(ts_runtime::Error::from)
             .map_err(Into::into)
@@ -279,13 +279,8 @@ impl Device {
 
     /// Look up the peer(s) with the most-specific route matches for `ip`.
     pub async fn peers_with_route(&self, ip: IpAddr) -> Result<Vec<NodeInfo>, Error> {
-        let pt = self
-            .runtime
-            .peer_tracker
-            .upgrade()
-            .ok_or(Error::Internal(InternalErrorKind::Actor))?;
-
-        pt.ask(ts_runtime::peer_tracker::PeerByAcceptedRoute { ip })
+        self.runtime
+            .ask(ts_runtime::peer_tracker::PeerByAcceptedRoute { ip })
             .await
             .map_err(ts_runtime::Error::from)
             .map_err(Into::into)
@@ -298,7 +293,29 @@ impl Device {
     ///
     /// If `timeout` is `None`, then shutdown will never time-out.
     pub async fn shutdown(self, timeout: Option<Duration>) -> bool {
-        self.runtime.graceful_shutdown(timeout).await
+        match timeout {
+            Some(timeout) => {
+                if tokio::time::timeout(timeout, async {
+                    let _ = self.runtime.stop_gracefully().await;
+                    self.runtime.wait_for_shutdown().await;
+                })
+                .await
+                .is_err()
+                {
+                    self.runtime.kill();
+
+                    return false;
+                }
+
+                true
+            }
+            None => {
+                let _ = self.runtime.stop_gracefully().await;
+                self.runtime.wait_for_shutdown().await;
+
+                true
+            }
+        }
     }
 }
 
