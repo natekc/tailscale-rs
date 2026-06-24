@@ -5,7 +5,7 @@ use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use ts_capabilityversion::CapabilityVersion;
 use ts_http_util::{BytesBody, ClientExt, EmptyBody, HeaderName, HeaderValue, Http2, ResponseExt};
-use ts_keys::{MachineKeyPair, MachinePrivateKey, MachinePublicKey};
+use ts_keys::{MachineKeyPair, MachinePublicKey};
 use url::Url;
 use zerocopy::network_endian::U32;
 
@@ -161,19 +161,12 @@ pub async fn connect(
 
     let (handshake, init_msg) = ts_control_noise::Handshake::initialize(
         &CONTROL_PROTOCOL_VERSION,
-        &machine_keys.private,
+        machine_keys,
         &control_public_key,
         CapabilityVersion::CURRENT,
     );
 
-    let conn = upgrade_ts2021(
-        control_url,
-        &init_msg,
-        handshake,
-        &machine_keys.private,
-        h1_client,
-    )
-    .await?;
+    let conn = upgrade_ts2021(control_url, &init_msg, handshake, machine_keys, h1_client).await?;
 
     // The early payload (challenge packet) is optional. The server may send
     // the magic prefix [FF FF FF 'T' 'S'] followed by a JSON challenge, or it
@@ -233,7 +226,7 @@ pub async fn upgrade_ts2021(
     control_url: &Url,
     init_msg: &str,
     handshake: ts_control_noise::Handshake,
-    machine_private_key: &MachinePrivateKey,
+    machine_key: &MachineKeyPair,
     h1_client: impl ts_http_util::Client<EmptyBody>,
 ) -> Result<impl AsyncRead + AsyncWrite + Unpin + 'static, ConnectionError> {
     let ts2021_url = control_url.join("/ts2021")?;
@@ -259,7 +252,7 @@ pub async fn upgrade_ts2021(
         ConnectionError::Internal(InternalErrorKind::Http)
     })?;
 
-    let conn = handshake.complete(upgraded, machine_private_key).await?;
+    let conn = handshake.complete(upgraded, machine_key).await?;
 
     tracing::debug!("upgraded control connection from HTTP/1.1 to TS2021");
 

@@ -21,6 +21,8 @@ x25519-dalek.workspace = true
 zerocopy.workspace = true
 zeroize.workspace = true
 
+ts_keys.workspace = true
+
 [dev-dependencies]
 hex.workspace = true
 

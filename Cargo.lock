@@ -6080,6 +6080,7 @@ dependencies = [
  "hex",
  "hkdf 0.12.4",
  "itertools",
+ "ts_keys",
  "x25519-dalek",
  "zerocopy",
  "zeroize",

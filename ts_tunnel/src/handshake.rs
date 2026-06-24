@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use ts_keys::{NodeKeyPair, NodePrivateKey, NodePublicKey};
+use ts_keys::{NodeKeyPair, NodePublicKey};
 use ts_noise::ikpsk2;
 use ts_packet::PacketMut;
 use ts_time::Handle;
@@ -78,7 +78,7 @@ impl ReceivedHandshake {
 
 /// Generate a handshake initiation message for a peer.
 pub fn initiate_handshake(
-    endpoint_static: &NodePrivateKey,
+    endpoint_static: &NodeKeyPair,
     peer_static: &NodePublicKey,
     session_id: SessionId,
     timestamp: TAI64N,
@@ -190,7 +190,7 @@ impl Handshake {
     pub(crate) fn finish(
         &mut self,
         packet: &mut HandshakeResponse,
-        endpoint_static: &NodePrivateKey,
+        endpoint_static: &NodeKeyPair,
         psk: &Psk,
         cookies: &MACReceiver,
         now: Instant,
@@ -275,7 +275,7 @@ mod tests {
         let a_session = SessionId::random(); // A wants to receive at this ID
         let a_init_time = TAI64N::now();
         let (a_handshake, init_pkt) =
-            initiate_handshake(&a_static.private, &b_static.public, a_session, a_init_time);
+            initiate_handshake(&a_static, &b_static.public, a_session, a_init_time);
 
         let mut init_pkt = PacketMut::from(init_pkt.as_bytes());
         let handshake_mac = a_mac_send.write_macs(init_pkt.as_mut());
@@ -303,13 +303,9 @@ mod tests {
         // Peer A receives response
         let response_pkt = HandshakeResponse::try_mut_from_bytes(response_pkt.as_mut())
             .expect("response_pkt should be a valid handshake response message");
-        let Some(mut a_session) = a_handshake.finish(
-            response_pkt,
-            &a_static.private,
-            &psk,
-            &a_mac_recv,
-            Instant::now(),
-        ) else {
+        let Some(mut a_session) =
+            a_handshake.finish(response_pkt, &a_static, &psk, &a_mac_recv, Instant::now())
+        else {
             panic!("failed to process handshake response from peer B");
         };
 

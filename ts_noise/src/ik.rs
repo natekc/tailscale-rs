@@ -1,5 +1,6 @@
 //! Implementation of the Noise IK handshake pattern.
 
+use ts_keys::X25519KeyPair;
 use zerocopy::FromBytes;
 
 use crate::{
@@ -25,23 +26,18 @@ impl ReceivedHandshake {
     ///
     /// Returns a [`ReceivedHandshake`] with information about the peer on success, or
     /// None if the handshake message is invalid in some way.
-    pub fn new(
-        packet: &mut [u8],
-        prologue: &[u8],
-        my_static: &x25519_dalek::StaticSecret,
-    ) -> Option<Self> {
+    pub fn new(packet: &mut [u8], prologue: &[u8], my_static: &X25519KeyPair) -> Option<Self> {
         let packet: &mut Init<()> = Init::mut_from_bytes(packet).ok()?;
 
         let peer_ephemeral_pub = x25519_dalek::PublicKey::from(packet.ephemeral_pub);
-        let my_static_pub = x25519_dalek::PublicKey::from(my_static);
 
         let handshake = State::new(PROTOCOL)
             .mix_hash(prologue) // prologue
-            .mix_hash(my_static_pub.as_ref()) // <- s ...
+            .mix_hash(my_static.public.as_ref()) // <- s ...
             .mix_hash(&packet.ephemeral_pub) // -> e
-            .mix_dh(my_static, &peer_ephemeral_pub) // es
+            .mix_dh(&my_static.private, &peer_ephemeral_pub) // es
             .open(&mut packet.static_pub, &packet.static_pub_tag)? // s
-            .mix_dh(my_static, &packet.static_pub.into()) // ss
+            .mix_dh(&my_static.private, &packet.static_pub.into()) // ss
             .open(&mut [], &packet.payload_tag)?; // payload
 
         Some(ReceivedHandshake {
@@ -61,25 +57,20 @@ impl ReceivedHandshake {
     /// If `packet` is the wrong size.
     #[inline]
     pub fn finish(self, packet: &mut [u8]) -> Session {
-        let my_ephemeral = x25519_dalek::StaticSecret::random();
-        self.finish_with_ephemeral(packet, my_ephemeral)
+        let ephemeral = X25519KeyPair::random();
+        self.finish_with_ephemeral(packet, ephemeral)
     }
 
-    fn finish_with_ephemeral(
-        self,
-        packet: &mut [u8],
-        my_ephemeral: x25519_dalek::StaticSecret,
-    ) -> Session {
+    fn finish_with_ephemeral(self, packet: &mut [u8], my_ephemeral: X25519KeyPair) -> Session {
         assert_eq!(packet.len(), Self::RESP_SIZE);
         let response = Resp::mut_from_bytes(packet).unwrap();
 
-        let my_ephemeral_pub = x25519_dalek::PublicKey::from(&my_ephemeral);
-        response.ephemeral_pub = my_ephemeral_pub.to_bytes();
+        response.ephemeral_pub = my_ephemeral.public.to_bytes();
 
         self.state
-            .mix_hash(my_ephemeral_pub.as_ref()) // <- e
-            .mix_dh(&my_ephemeral, &self.peer_ephemeral_pub) // ee
-            .mix_dh(&my_ephemeral, &self.peer_static_pub) // se
+            .mix_hash(my_ephemeral.public.as_ref()) // <- e
+            .mix_dh(&my_ephemeral.private, &self.peer_ephemeral_pub) // ee
+            .mix_dh(&my_ephemeral.private, &self.peer_static_pub) // se
             .seal(&mut [], &mut response.auth_tag) // payload
             .finish_as_responder()
     }
@@ -102,18 +93,18 @@ impl SentHandshake {
     /// If `packet` is not [`SentHandshake::INIT_SIZE`] bytes.
     #[inline]
     pub fn new(
-        my_static: x25519_dalek::StaticSecret,
+        my_static: X25519KeyPair,
         peer_static: x25519_dalek::PublicKey,
         prologue: &[u8],
         out: &mut [u8],
     ) -> Self {
-        let ephemeral = x25519_dalek::StaticSecret::random();
+        let ephemeral = X25519KeyPair::random();
         SentHandshake::new_with_ephemeral(my_static, ephemeral, peer_static, prologue, out)
     }
 
     fn new_with_ephemeral(
-        my_static: x25519_dalek::StaticSecret,
-        my_ephemeral: x25519_dalek::StaticSecret,
+        my_static: X25519KeyPair,
+        my_ephemeral: X25519KeyPair,
         peer_static: x25519_dalek::PublicKey,
         prologue: &[u8],
         out: &mut [u8],
@@ -121,21 +112,21 @@ impl SentHandshake {
         assert_eq!(out.len(), Self::INIT_SIZE);
         let out: &mut Init<()> = Init::mut_from_bytes(out).unwrap();
 
-        out.ephemeral_pub = x25519_dalek::PublicKey::from(&my_ephemeral).to_bytes();
-        out.static_pub = x25519_dalek::PublicKey::from(&my_static).to_bytes();
+        out.ephemeral_pub = my_ephemeral.public.to_bytes();
+        out.static_pub = my_static.public.to_bytes();
 
         let state = State::new(PROTOCOL)
             .mix_hash(prologue) // prologue
             .mix_hash(peer_static.as_ref()) // <- s
             .mix_hash(&out.ephemeral_pub) // -> e
-            .mix_dh(&my_ephemeral, &peer_static) // es
+            .mix_dh(&my_ephemeral.private, &peer_static) // es
             .seal(&mut out.static_pub, &mut out.static_pub_tag) // s
-            .mix_dh(&my_static, &peer_static) // ss
+            .mix_dh(&my_static.private, &peer_static) // ss
             .seal(&mut [], &mut out.payload_tag); // payload
 
         SentHandshake {
             state,
-            my_ephemeral,
+            my_ephemeral: my_ephemeral.private,
         }
     }
 
@@ -144,11 +135,7 @@ impl SentHandshake {
     /// If successful, consumes `self` and returns keys for the new session.
     /// If the response is invalid, returns `Err(self)` to allow for another finalization
     /// attempt later.
-    pub fn try_finish(
-        self,
-        packet: &mut [u8],
-        my_static: x25519_dalek::StaticSecret,
-    ) -> Result<Session, Self> {
+    pub fn try_finish(self, packet: &mut [u8], my_static: X25519KeyPair) -> Result<Session, Self> {
         let Ok(packet) = Resp::mut_from_bytes(packet) else {
             return Err(self);
         };
@@ -159,7 +146,7 @@ impl SentHandshake {
         let ret = state
             .mix_hash(&packet.ephemeral_pub) // e
             .mix_dh(&self.my_ephemeral, &peer_ephemeral_pub) // ee
-            .mix_dh(&my_static, &peer_ephemeral_pub) // se
+            .mix_dh(&my_static.private, &peer_ephemeral_pub) // se
             .open(&mut [], &packet.auth_tag)
             .ok_or(self)? // payload
             .finish_as_initiator();
@@ -176,20 +163,20 @@ mod tests {
 
     use super::*;
 
-    fn test_key(r: Range<u8>) -> (x25519_dalek::StaticSecret, x25519_dalek::PublicKey) {
+    fn test_key(r: Range<u8>) -> X25519KeyPair {
         assert_eq!(r.len(), 32);
         let private = x25519_dalek::StaticSecret::from(r.collect_array().unwrap());
         let public = x25519_dalek::PublicKey::from(&private);
-        (private, public)
+        X25519KeyPair { private, public }
     }
 
     #[test]
     fn test_handshake() {
-        let (init_static, init_static_pub) = test_key(0..32);
-        let (init_ephemeral, _) = test_key(32..64);
+        let init_static = test_key(0..32);
+        let init_ephemeral = test_key(32..64);
 
-        let (resp_static, resp_static_pub) = test_key(64..96);
-        let (resp_ephemeral, _) = test_key(96..128);
+        let resp_static = test_key(64..96);
+        let resp_ephemeral = test_key(96..128);
 
         const PROLOGUE: &[u8] = b"TEST HANDSHAKE";
 
@@ -202,14 +189,14 @@ mod tests {
         let init_sent = SentHandshake::new_with_ephemeral(
             init_static.clone(),
             init_ephemeral,
-            resp_static_pub,
+            resp_static.public,
             PROLOGUE,
             &mut init_packet,
         );
         assert_eq!(init_packet, expected_init_packet.as_ref());
 
         let resp_recv = ReceivedHandshake::new(&mut init_packet, PROLOGUE, &resp_static).unwrap();
-        assert_eq!(resp_recv.peer_static_pub, init_static_pub);
+        assert_eq!(resp_recv.peer_static_pub, init_static.public);
 
         let mut resp_packet = [0; ReceivedHandshake::RESP_SIZE];
         let resp_session = resp_recv.finish_with_ephemeral(&mut resp_packet, resp_ephemeral);

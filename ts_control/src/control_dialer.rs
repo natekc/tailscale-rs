@@ -250,14 +250,13 @@ where
 
     let (handshake, init_msg) = ts_control_noise::Handshake::initialize(
         &crate::tokio::CONTROL_PROTOCOL_VERSION,
-        &machine_keys.private,
+        machine_keys,
         &control_public_key,
         CapabilityVersion::CURRENT,
     );
 
     let conn =
-        crate::tokio::upgrade_ts2021(url, &init_msg, handshake, &machine_keys.private, h1_client)
-            .await?;
+        crate::tokio::upgrade_ts2021(url, &init_msg, handshake, machine_keys, h1_client).await?;
     let conn = crate::tokio::read_challenge_packet(conn).await?;
 
     let h2_conn = ts_http_util::http2::connect(conn).await?;
