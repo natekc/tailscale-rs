@@ -5973,6 +5973,9 @@ dependencies = [
 [[package]]
 name = "ts_kv_store"
 version = "0.3.3"
+dependencies = [
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "ts_netcheck"

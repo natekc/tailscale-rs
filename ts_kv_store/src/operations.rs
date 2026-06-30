@@ -16,7 +16,7 @@ use std::{
 };
 
 use crate::{
-    IndexIterator, Owner, Result, TableIterator, iter,
+    AccessError, AccessResult, IndexIterator, Owner, Result, TableIterator, iter,
     schema::{self, IndexDesc, TableDesc},
     storage::Storage,
 };
@@ -226,7 +226,21 @@ pub(crate) trait IndexedOps<TableStorage: schema::GeneratedStorage>:
         base.is_empty(storage.txn_id())
     }
 
-    fn get<Q>(self, key: &Q, _owner: Owner) -> Option<BaseValue<Self::IndexDesc>>
+    fn check_consistent(self) -> Result<()> {
+        let storage = self.read_lock();
+        let storage = storage.storage();
+        let index = <Self::IndexDesc as TableDesc>::get_table(&storage.tables);
+
+        if index.is_poisoned(storage.txn_id()) {
+            Err(crate::Error::NonUniqueIndexKey(
+                <Self::IndexDesc as TableDesc>::NAME,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn get<Q>(self, key: &Q, _owner: Owner) -> AccessResult<BaseValue<Self::IndexDesc>>
     where
         IndexKey<Self::IndexDesc>: Borrow<Q>,
         IndexValue<Self::IndexDesc>: Hash + Eq,
@@ -237,8 +251,17 @@ pub(crate) trait IndexedOps<TableStorage: schema::GeneratedStorage>:
         let storage = storage.storage();
         let base = Base::<Self::IndexDesc>::get_table(&storage.tables);
         let index = <Self::IndexDesc as TableDesc>::get_table(&storage.tables);
-        let base_key = index.get(key, storage.txn_id())?;
-        base.get(base_key, storage.txn_id()).cloned()
+        if index.is_poisoned(storage.txn_id()) {
+            return Err(AccessError::NonUniqueIndexKey(
+                <Self::IndexDesc as TableDesc>::NAME,
+            ));
+        }
+        let base_key = index
+            .get(key, storage.txn_id())
+            .ok_or(AccessError::NotPresent)?;
+        base.get(base_key, storage.txn_id())
+            .cloned()
+            .ok_or(AccessError::NotPresent)
     }
 
     fn with<Q, T>(
@@ -246,7 +269,7 @@ pub(crate) trait IndexedOps<TableStorage: schema::GeneratedStorage>:
         key: &Q,
         f: impl FnOnce(&BaseValue<Self::IndexDesc>) -> T,
         _owner: Owner,
-    ) -> Option<T>
+    ) -> AccessResult<T>
     where
         IndexKey<Self::IndexDesc>: Borrow<Q>,
         IndexValue<Self::IndexDesc>: Hash + Eq,
@@ -256,10 +279,19 @@ pub(crate) trait IndexedOps<TableStorage: schema::GeneratedStorage>:
         let storage = storage.storage();
         let base = Base::<Self::IndexDesc>::get_table(&storage.tables);
         let index = <Self::IndexDesc>::get_table(&storage.tables);
-        let base_key = index.get(key, storage.txn_id())?;
-        let value = base.get(base_key, storage.txn_id())?;
+        if index.is_poisoned(storage.txn_id()) {
+            return Err(AccessError::NonUniqueIndexKey(
+                <Self::IndexDesc as TableDesc>::NAME,
+            ));
+        }
+        let base_key = index
+            .get(key, storage.txn_id())
+            .ok_or(AccessError::NotPresent)?;
+        let value = base
+            .get(base_key, storage.txn_id())
+            .ok_or(AccessError::NotPresent)?;
 
-        Some(f(value))
+        Ok(f(value))
     }
 
     fn iter<'guard>(
@@ -480,7 +512,7 @@ pub(crate) trait IndexedOpsMut<TableStorage: schema::GeneratedStorage>:
         key: &Q,
         f: impl FnOnce(&mut BaseValue<Self::IndexDesc>) -> T,
         owner: Owner,
-    ) -> Option<T>
+    ) -> AccessResult<T>
     where
         IndexKey<Self::IndexDesc>: Borrow<Q>,
         Q: ?Sized + Hash + Eq,
@@ -495,10 +527,16 @@ pub(crate) trait IndexedOpsMut<TableStorage: schema::GeneratedStorage>:
         let (base, index) = schema::get_two_tables_mut::<_, Base<Self::IndexDesc>, Self::IndexDesc>(
             &mut storage.tables,
         );
+        if index.is_poisoned(txn_id) {
+            return Err(AccessError::NonUniqueIndexKey(
+                <Self::IndexDesc as TableDesc>::NAME,
+            ));
+        }
         base.assert_owner(owner);
 
-        let base_key = index.get(key, txn_id)?;
+        let base_key = index.get(key, txn_id).ok_or(AccessError::NotPresent)?;
         base.with_mut(base_key, f, txn_id, max_committed_id)
+            .ok_or(AccessError::NotPresent)
     }
 
     fn remove<Q>(self, key: &Q, owner: Owner)

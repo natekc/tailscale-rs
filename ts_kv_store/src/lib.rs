@@ -78,8 +78,8 @@
 //! The key type is `Url` and the value type is `u64`.
 //!
 //! Index fields must uniquely identify a row in the base table. If multiple rows in the base table
-//! have the same key in the index, then behavior is unspecified (might give partial or incorrect
-//! result, might panic, etc.).
+//! have the same key in the index, then either a panic is triggered, or accessing or committing a
+//! non-unique index will cause an error. See the schema macro docs for more.
 //!
 //! # Async access
 //!
@@ -246,14 +246,95 @@ impl<'store, TableStorage: schema::GeneratedStorage> operations::OpsMut<TableSto
 pub type Owner = &'static str;
 
 /// An error from a [`KvStore`].
-// TODO derive(Error)
-#[derive(Debug, Clone)]
+#[derive(thiserror::Error, Debug, Clone, PartialEq)]
 pub enum Error {
     /// A table was expected to not be initialized, but was by the specified `Owner`.
+    #[error("A table has already been initialized with owner `{0}`")]
     AlreadyInit(Owner),
     /// An inconsistency caused a transaction to fail. It has not been committed and can be re-tried.
+    #[error("Transaction Failed")]
     TransactionFailed,
+    /// An index had multiple primary keys for a single index key. If returned when committing a
+    /// transaction, the transaction will not have been committed.
+    #[error("An attempt to store a non-unique index key in `{0}`")]
+    NonUniqueIndexKey(&'static str),
+}
+
+/// An error occuring during accessing of the store.
+#[derive(thiserror::Error, Debug, Clone, PartialEq)]
+pub enum AccessError {
+    /// The requested key is not present in the store.
+    #[error("Key not found")]
+    NotPresent,
+    /// An index had multiple primary keys for a single index key. If returned when committing a
+    /// transaction, the transaction will not have been committed.
+    #[error("An attempt to store a non-unique index key in `{0}`")]
+    NonUniqueIndexKey(&'static str),
 }
 
 /// `Result` alias for a KvStore [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// `Result` alias for a KvStore [`AccessError`].
+pub type AccessResult<T> = std::result::Result<T, AccessError>;
+
+/// Helper trait for making it easier for [`AccessError`] and `Option` to interoperate.
+///
+/// The key observation is that `Result<T, AccessError>` is logically equivalent to `Result<Option<T>, Error>`
+/// (well a 'subtype' of sorts). This trait allows treating `Result<T, AccessError>` a bit more like
+/// an `Option` in various ways so that using functions which return `Result<T, AccessError>` can be
+/// more ergonomic. (Annoyingly we can't implement helpers directly on `Result` or make conversion
+/// via `From` work).
+pub trait AccessErrorExt<T> {
+    /// Convert a `Result<T, AccessError>` into `Result<Option<T>, Error>`.
+    fn try_opt(self) -> Result<Option<T>>;
+    /// Convert a `Result<T, AccessError>` into `Option<T>`, panicking if the `AccessError` is anything
+    /// other than `NotPresent`.
+    fn unwrap_opt(self) -> Option<T>;
+    /// Convert a `&Result<T, AccessError>` into `&Option<T>`, panicking if the `AccessError` is anything
+    /// other than `NotPresent`.
+    fn unwrap_opt_ref(&self) -> Option<&T>;
+    /// True if self is `Ok`, i.e., there was no error and the requested key was present.
+    fn is_some(&self) -> bool;
+    /// True if self is `Err(AccessError::NotPresent)`, i.e., there was no error and the requested
+    /// key was not present.
+    fn is_none(&self) -> bool;
+}
+
+impl<T> AccessErrorExt<T> for AccessResult<T> {
+    fn try_opt(self) -> Result<Option<T>> {
+        match self {
+            Ok(t) => Ok(Some(t)),
+            Err(AccessError::NotPresent) => Ok(None),
+            Err(AccessError::NonUniqueIndexKey(t)) => Err(Error::NonUniqueIndexKey(t)),
+        }
+    }
+
+    fn unwrap_opt(self) -> Option<T> {
+        match self {
+            Ok(t) => Some(t),
+            Err(AccessError::NotPresent) => None,
+            Err(e @ AccessError::NonUniqueIndexKey(_)) => {
+                panic!("Expected `Ok` or not present, found: {e}")
+            }
+        }
+    }
+
+    fn unwrap_opt_ref(&self) -> Option<&T> {
+        match self {
+            Ok(t) => Some(t),
+            Err(AccessError::NotPresent) => None,
+            Err(e @ AccessError::NonUniqueIndexKey(_)) => {
+                panic!("Expected `Ok` or not present, found: {e}")
+            }
+        }
+    }
+
+    fn is_some(&self) -> bool {
+        self.is_ok()
+    }
+
+    fn is_none(&self) -> bool {
+        matches!(self, Err(AccessError::NotPresent))
+    }
+}
