@@ -269,6 +269,8 @@ impl kameo::Actor for Multiderp {
         env.subscribe::<Arc<PeerState>>(&slf).await?;
         env.subscribe::<DerpLatencyMeasurement>(&slf).await?;
 
+        env.register(None, &slf).await?;
+
         Ok(Self {
             env,
             dataplane,
