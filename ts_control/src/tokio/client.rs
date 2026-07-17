@@ -1,4 +1,5 @@
 use alloc::{collections::BTreeMap, sync::Arc};
+use core::time::Duration;
 
 use futures_util::{Stream, StreamExt};
 use tokio::{
@@ -16,6 +17,10 @@ use crate::{
         ping::handle_ping,
     },
 };
+
+// The control server sends a keepalive about once per minute. Match the Go client's deadline so a
+// half-open connection is replaced instead of waiting forever for another map response.
+const MAP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// A client to communicate with control.
 #[derive(Debug)]
@@ -234,49 +239,78 @@ async fn run_once(
     let mut stream = core::pin::pin!(map_stream(reader));
     tracing::info!("netmap stream started");
 
+    let mut last_map_response_at = tokio::time::Instant::now();
+
     loop {
-        tokio::select! {
-            state_update = stream.next() => {
-                let Some(state_update) = state_update else {
-                    break;
-                };
+        let state_update = {
+            let response = next_map_response(
+                &mut stream,
+                last_map_response_at,
+                MAP_RESPONSE_TIMEOUT,
+            );
+            tokio::pin!(response);
 
-                let _ = handle_ping(&state_update, control_url, &h2_client).await;
+            loop {
+                tokio::select! {
+                    state_update = &mut response => break state_update,
+                    command = command_rx.recv() => {
+                        match command.unwrap() {
+                            Command::SetDerpHomeRegion { id, latencies } => {
+                                let mut builder = MapRequestBuilder::new(node_keys)
+                                    .keep_alive(false)
+                                    .omit_peers(true)
+                                    .stream(false)
+                                    .preferred_derp(id)
+                                    .derp_latencies(latencies.iter().map(|(k, v)| (k.as_str(), *v)));
 
-                if let Some(dial_plan) = &state_update.dial_plan
-                    && control_dialer.update_dial_plan(dial_plan)
-                {
-                    tracing::trace!(new_dial_plan = ?dial_plan);
-                }
+                                if let Some(hostname) = &config.hostname {
+                                    builder = builder.hostname(hostname);
+                                }
+                                let req = builder.build();
 
-                // This errors only if there are no receivers. That's not semantically an error for
-                // us, so just ignore it.
-                let _ignore = state_tx.send(Arc::new(state_update));
-            }
-
-            command = command_rx.recv() => {
-                match command.unwrap() {
-                    Command::SetDerpHomeRegion { id, latencies } => {
-                        let mut builder = MapRequestBuilder::new(node_keys)
-                            .keep_alive(false)
-                            .omit_peers(true)
-                            .stream(false)
-                            .preferred_derp(id)
-                            .derp_latencies(latencies.iter().map(|(k, v)| (k.as_str(), *v)));
-
-                        if let Some(hostname) = &config.hostname {
-                            builder = builder.hostname(hostname);
+                                drop(send_map_request(req, &map_url, &h2_client).await?);
+                            },
                         }
-                        let req = builder.build();
-
-                        drop(send_map_request(req, &map_url, &h2_client).await?);
-                    },
+                    }
                 }
             }
+        };
+
+        let Some(state_update) = state_update? else {
+            break;
+        };
+        last_map_response_at = tokio::time::Instant::now();
+
+        let _ = handle_ping(&state_update, control_url, &h2_client).await;
+
+        if let Some(dial_plan) = &state_update.dial_plan
+            && control_dialer.update_dial_plan(dial_plan)
+        {
+            tracing::trace!(new_dial_plan = ?dial_plan);
         }
+
+        // This errors only if there are no receivers. That's not semantically an error for
+        // us, so just ignore it.
+        let _ignore = state_tx.send(Arc::new(state_update));
     }
 
     Ok(())
+}
+
+async fn next_map_response<S>(
+    stream: &mut S,
+    last_response_at: tokio::time::Instant,
+    timeout: Duration,
+) -> Result<Option<S::Item>, Error>
+where
+    S: Stream + Unpin,
+{
+    tokio::time::timeout_at(last_response_at + timeout, stream.next())
+        .await
+        .map_err(|_| {
+            tracing::warn!(?timeout, "timed out waiting for a map response");
+            Error::NetworkError(crate::Operation::MapRequest)
+        })
 }
 
 fn netmap_stream(
@@ -289,4 +323,94 @@ fn netmap_stream(
 
         x.ok()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_map_stream_hits_watchdog() {
+        let mut stream = futures_util::stream::pending::<()>();
+        let timeout = core::time::Duration::from_secs(120);
+        let started_at = tokio::time::Instant::now();
+
+        let error = next_map_response(&mut stream, started_at, timeout)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, Error::NetworkError(crate::Operation::MapRequest));
+        assert_eq!(tokio::time::Instant::now() - started_at, timeout);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn map_responses_reset_watchdog() {
+        let (response_tx, response_rx) = tokio::sync::mpsc::channel(2);
+        let response_tx_guard = response_tx.clone();
+        tokio::spawn(async move {
+            for response in [1, 2] {
+                tokio::time::sleep(core::time::Duration::from_secs(90)).await;
+                response_tx.send(response).await.unwrap();
+            }
+        });
+
+        let mut stream = tokio_stream::wrappers::ReceiverStream::new(response_rx);
+        let timeout = core::time::Duration::from_secs(120);
+        let started_at = tokio::time::Instant::now();
+        let mut last_response_at = started_at;
+
+        assert_eq!(
+            next_map_response(&mut stream, last_response_at, timeout)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        last_response_at = tokio::time::Instant::now();
+        assert_eq!(
+            next_map_response(&mut stream, last_response_at, timeout)
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        last_response_at = tokio::time::Instant::now();
+        assert_eq!(
+            tokio::time::Instant::now() - started_at,
+            core::time::Duration::from_secs(180)
+        );
+        assert_eq!(
+            next_map_response(&mut stream, last_response_at, timeout)
+                .await
+                .unwrap_err(),
+            Error::NetworkError(crate::Operation::MapRequest)
+        );
+        assert_eq!(
+            tokio::time::Instant::now() - started_at,
+            core::time::Duration::from_secs(300)
+        );
+
+        drop(response_tx_guard);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn command_activity_does_not_postpone_watchdog() {
+        let mut stream = futures_util::stream::pending::<()>();
+        let timeout = core::time::Duration::from_secs(120);
+        let started_at = tokio::time::Instant::now();
+        let response = next_map_response(&mut stream, started_at, timeout);
+        tokio::pin!(response);
+
+        for _ in 0..3 {
+            tokio::select! {
+                result = &mut response => {
+                    panic!("map response wait completed early: {result:?}");
+                }
+                () = tokio::time::sleep(core::time::Duration::from_secs(30)) => {}
+            }
+        }
+
+        let error = response.await.unwrap_err();
+
+        assert_eq!(error, Error::NetworkError(crate::Operation::MapRequest));
+        assert_eq!(tokio::time::Instant::now() - started_at, timeout);
+    }
 }
