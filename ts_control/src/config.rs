@@ -23,6 +23,10 @@ pub struct Config {
 
     /// Tags to request from the control server.
     pub tags: Vec<String>,
+
+    /// Whether the control server should remove this node shortly after it disconnects.
+    #[serde(default)]
+    pub ephemeral: bool,
 }
 
 impl Config {
@@ -46,6 +50,7 @@ impl Debug for Config {
             .field("hostname", &self.hostname)
             .field("server_url", &self.server_url.as_str())
             .field("client_name", &self.client_name)
+            .field("ephemeral", &self.ephemeral)
             .finish()
     }
 }
@@ -57,6 +62,31 @@ impl Default for Config {
             hostname: gethostname::gethostname().into_string().ok(),
             client_name: None,
             tags: Default::default(),
+            ephemeral: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nodes_are_persistent_by_default() {
+        assert!(!Config::default().ephemeral);
+    }
+
+    #[test]
+    fn legacy_config_without_ephemeral_setting_is_persistent() {
+        let mut serialized = serde_json::to_value(Config::default()).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("ephemeral")
+            .unwrap();
+
+        let config: Config = serde_json::from_value(serialized).unwrap();
+
+        assert!(!config.ephemeral);
     }
 }
