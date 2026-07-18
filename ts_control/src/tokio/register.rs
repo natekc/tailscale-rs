@@ -112,22 +112,8 @@ pub async fn register(
     http2_conn: &Http2<BytesBody>,
 ) -> Result<(), RegistrationError> {
     let node_public_key = node_keystate.node_keys.public;
-    let network_lock_public_key = node_keystate.network_lock_keys.public;
-
-    let register_req = RegisterRequest {
-        version: CapabilityVersion::CURRENT,
-        node_key: node_public_key,
-        hostinfo: HostInfo {
-            hostname: config.hostname.as_deref(),
-            app: &config.format_client_name(),
-            ipn_version: crate::PKG_VERSION,
-            ..Default::default()
-        },
-        nl_key: Some(network_lock_public_key),
-        auth: auth_key.map(RegisterAuth::from),
-        ephemeral: true,
-        ..Default::default()
-    };
+    let client_name = config.format_client_name();
+    let register_req = register_request(config, auth_key, node_keystate, &client_name);
 
     let body = if cfg!(debug_assertions) {
         serde_json::to_string_pretty(&register_req)?
@@ -184,5 +170,57 @@ pub async fn register(
         }
     } else {
         Ok(())
+    }
+}
+
+fn register_request<'a>(
+    config: &'a crate::Config,
+    auth_key: Option<&'a str>,
+    node_keystate: &'a ts_keys::NodeState,
+    client_name: &'a str,
+) -> RegisterRequest<'a> {
+    let network_lock_public_key = node_keystate.network_lock_keys.public;
+
+    RegisterRequest {
+        version: CapabilityVersion::CURRENT,
+        node_key: node_keystate.node_keys.public,
+        hostinfo: HostInfo {
+            hostname: config.hostname.as_deref(),
+            app: client_name,
+            ipn_version: crate::PKG_VERSION,
+            ..Default::default()
+        },
+        nl_key: Some(network_lock_public_key),
+        auth: auth_key.map(RegisterAuth::from),
+        ephemeral: config.ephemeral,
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persistent_registration_omits_ephemeral_flag() {
+        let config = crate::Config::default();
+        let node_keystate = ts_keys::NodeState::default();
+        let request = register_request(&config, None, &node_keystate, "tailscale-rs");
+        let payload = serde_json::to_value(request).unwrap();
+
+        assert!(payload.get("Ephemeral").is_none());
+    }
+
+    #[test]
+    fn ephemeral_registration_sets_ephemeral_flag() {
+        let config = crate::Config {
+            ephemeral: true,
+            ..Default::default()
+        };
+        let node_keystate = ts_keys::NodeState::default();
+        let request = register_request(&config, None, &node_keystate, "tailscale-rs");
+        let payload = serde_json::to_value(request).unwrap();
+
+        assert_eq!(payload.get("Ephemeral"), Some(&serde_json::Value::Bool(true)));
     }
 }

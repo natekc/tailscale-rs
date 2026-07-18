@@ -231,12 +231,39 @@ struct Runner {
 impl Runner {
     const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// Backoff applied after a DERP session ends with an error, before reconnecting, so a
+    /// persistently failing region does not reconnect in a tight loop.
+    const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
+
     #[tracing::instrument(skip_all, fields(region_id = %self.region_id))]
     async fn run(&mut self) -> Result<(), ts_derp::Error> {
         loop {
             let pending = self.wait_for_activity().await;
-            let transport = self.connect(pending).await?;
-            self.run_transport(transport).await?;
+
+            // A DERP connection can be reset at any time. Previously an error from `connect` or
+            // `run_transport` propagated out of `run`, ending the runner: the region's data
+            // plane silently stopped and was only revived by a later derp map change. Instead,
+            // log and reconnect after a short backoff, mirroring how the control client's run
+            // loop recovers from a dropped stream. A graceful end (e.g. a non-home region
+            // closing after inactivity) reconnects/re-waits immediately.
+            let outcome = match self.connect(pending).await {
+                Ok(transport) => self.run_transport(transport).await,
+                Err(e) => Err(e),
+            };
+
+            Self::backoff_on_error(&outcome, Self::RECONNECT_BACKOFF).await;
+        }
+    }
+
+    /// Sleep for `backoff` only when the previous DERP session ended with an error, so failing
+    /// reconnects are rate-limited while graceful closures loop immediately.
+    async fn backoff_on_error<E>(outcome: &Result<(), E>, backoff: Duration)
+    where
+        E: core::fmt::Display,
+    {
+        if let Err(e) = outcome {
+            tracing::warn!(error = %e, "derp session ended with error; backing off before reconnect");
+            tokio::time::sleep(backoff).await;
         }
     }
 
@@ -369,5 +396,30 @@ async fn option_timeout(duration: Option<Instant>) {
     match duration {
         Some(dur) => tokio::time::sleep_until(dur.into()).await,
         None => core::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn backs_off_after_an_errored_session() {
+        let backoff = Duration::from_millis(500);
+        let started_at = tokio::time::Instant::now();
+
+        Runner::backoff_on_error(&Result::<(), &str>::Err("connection reset"), backoff).await;
+
+        assert_eq!(tokio::time::Instant::now() - started_at, backoff);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn does_not_back_off_after_a_graceful_session() {
+        let backoff = Duration::from_millis(500);
+        let started_at = tokio::time::Instant::now();
+
+        Runner::backoff_on_error(&Result::<(), &str>::Ok(()), backoff).await;
+
+        assert_eq!(tokio::time::Instant::now() - started_at, Duration::ZERO);
     }
 }

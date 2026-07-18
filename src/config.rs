@@ -33,6 +33,9 @@ pub struct Config {
 
     /// Tags this node will request.
     pub requested_tags: Vec<String>,
+
+    /// Whether the control server should remove this node shortly after it disconnects.
+    pub ephemeral: bool,
 }
 
 impl Config {
@@ -162,6 +165,7 @@ impl From<&Config> for ts_control::Config {
             hostname: value.requested_hostname.clone(),
             server_url: value.control_server_url.clone(),
             tags: value.requested_tags.clone(),
+            ephemeral: value.ephemeral,
         }
     }
 }
@@ -174,6 +178,7 @@ impl Default for Config {
             control_server_url: ts_control::DEFAULT_CONTROL_SERVER.clone(),
             requested_hostname: None,
             requested_tags: vec![],
+            ephemeral: false,
         }
     }
 }
@@ -273,4 +278,21 @@ async fn try_write(
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ephemeral_setting_propagates_to_control_config() {
+        let config = Config {
+            ephemeral: true,
+            ..Default::default()
+        };
+
+        let control_config = ts_control::Config::from(&config);
+
+        assert!(control_config.ephemeral);
+    }
 }

@@ -49,6 +49,7 @@ chrono.workspace = true
 itertools.workspace = true
 proptest.workspace = true
 rand.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros", "rt", "time"] }
 tokio-test = "0.4"
 ts_capabilityversion.workspace = true
 
