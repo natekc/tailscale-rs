@@ -39,6 +39,11 @@ pub struct config<'a> {
     ///
     /// If `NULL`, ephemeral key state is generated.
     pub key_state: Option<&'a mut persisted_key_state>,
+
+    /// Whether to register this node as ephemeral.
+    ///
+    /// Ephemeral nodes are removed from the tailnet after being offline for a brief period.
+    pub ephemeral: bool,
 }
 
 impl config<'_> {
@@ -96,6 +101,8 @@ impl config<'_> {
             })
         }
         .collect();
+
+        cfg.ephemeral = self.ephemeral;
 
         cfg
     }
