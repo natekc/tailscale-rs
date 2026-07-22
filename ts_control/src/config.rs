@@ -23,6 +23,11 @@ pub struct Config {
 
     /// Tags to request from the control server.
     pub tags: Vec<String>,
+
+    /// Whether this node is registered as ephemeral.
+    ///
+    /// Ephemeral nodes are deleted by control after a short period of inactivity.
+    pub ephemeral: bool,
 }
 
 impl Config {
@@ -46,6 +51,7 @@ impl Debug for Config {
             .field("hostname", &self.hostname)
             .field("server_url", &self.server_url.as_str())
             .field("client_name", &self.client_name)
+            .field("ephemeral", &self.ephemeral)
             .finish()
     }
 }
@@ -57,6 +63,7 @@ impl Default for Config {
             hostname: gethostname::gethostname().into_string().ok(),
             client_name: None,
             tags: Default::default(),
+            ephemeral: false,
         }
     }
 }

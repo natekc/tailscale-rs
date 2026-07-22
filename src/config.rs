@@ -33,6 +33,17 @@ pub struct Config {
 
     /// Tags this node will request.
     pub requested_tags: Vec<String>,
+
+    /// Whether this node should register itself as ephemeral.
+    ///
+    /// This means that the node will be deleted from the tailnet after it is offline for a brief
+    /// period. It can be registered again with the same keys in the future but will have a
+    /// different node id.
+    ///
+    /// See the [KB article on ephemeral nodes] for more information.
+    ///
+    /// [KB article on ephemeral nodes]: https://tailscale.com/docs/features/ephemeral-nodes
+    pub ephemeral: bool,
 }
 
 impl Config {
@@ -162,6 +173,7 @@ impl From<&Config> for ts_control::Config {
             hostname: value.requested_hostname.clone(),
             server_url: value.control_server_url.clone(),
             tags: value.requested_tags.clone(),
+            ephemeral: value.ephemeral,
         }
     }
 }
@@ -174,6 +186,7 @@ impl Default for Config {
             control_server_url: ts_control::DEFAULT_CONTROL_SERVER.clone(),
             requested_hostname: None,
             requested_tags: vec![],
+            ephemeral: false,
         }
     }
 }

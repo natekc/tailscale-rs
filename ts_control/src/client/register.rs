@@ -125,7 +125,7 @@ pub async fn register(
         },
         nl_key: Some(network_lock_public_key),
         auth: auth_key.map(RegisterAuth::from),
-        ephemeral: true,
+        ephemeral: config.ephemeral,
         ..Default::default()
     };
 
